@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
+import pytest
 from moto import mock_aws
 
 from airflow.providers.amazon.aws.hooks.dynamodb import DynamoDBHook
@@ -234,3 +237,93 @@ class TestDynamoDBMultipleValuesSensor:
         hook.write_batch_data(items)
 
         assert self.sensor.poke(None)
+
+
+class TestDynamoDBValueSensorDeferrable:
+    def setup_method(self):
+        self.table_name = "test_airflow"
+        self.pk_name = "PK"
+        self.pk_value = "PKTest"
+        self.attribute_name = "status"
+        self.attribute_value = "COMPLETED"
+
+    def test_execute_defers(self):
+        from airflow.exceptions import TaskDeferred
+        from airflow.providers.amazon.aws.triggers.dynamodb import DynamoDBValueTrigger
+
+        sensor = DynamoDBValueSensor(
+            task_id="dynamodb_deferrable_sensor",
+            table_name=self.table_name,
+            partition_key_name=self.pk_name,
+            partition_key_value=self.pk_value,
+            attribute_name=self.attribute_name,
+            attribute_value=self.attribute_value,
+            deferrable=True,
+            waiter_delay=30,
+        )
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute(context=mock.MagicMock())
+        assert isinstance(exc_info.value.trigger, DynamoDBValueTrigger)
+
+    def test_execute_non_deferrable_calls_super(self):
+        sensor = DynamoDBValueSensor(
+            task_id="dynamodb_nondeferrable_sensor",
+            table_name=self.table_name,
+            partition_key_name=self.pk_name,
+            partition_key_value=self.pk_value,
+            attribute_name=self.attribute_name,
+            attribute_value=self.attribute_value,
+            deferrable=False,
+        )
+        with mock.patch("airflow.providers.amazon.aws.sensors.base_aws.AwsBaseSensor.execute") as mock_super:
+            sensor.execute(context=mock.MagicMock())
+            mock_super.assert_called_once()
+
+    def test_execute_complete_success(self):
+        sensor = DynamoDBValueSensor(
+            task_id="dynamodb_deferrable_sensor",
+            table_name=self.table_name,
+            partition_key_name=self.pk_name,
+            partition_key_value=self.pk_value,
+            attribute_name=self.attribute_name,
+            attribute_value=self.attribute_value,
+            deferrable=True,
+        )
+        # Should not raise
+        sensor.execute_complete(context=mock.MagicMock(), event={"status": "success"})
+
+    def test_execute_complete_failure_raises(self):
+        from airflow.providers.common.compat.sdk import AirflowException
+
+        sensor = DynamoDBValueSensor(
+            task_id="dynamodb_deferrable_sensor",
+            table_name=self.table_name,
+            partition_key_name=self.pk_name,
+            partition_key_value=self.pk_value,
+            attribute_name=self.attribute_name,
+            attribute_value=self.attribute_value,
+            deferrable=True,
+        )
+        with pytest.raises(AirflowException):
+            sensor.execute_complete(context=mock.MagicMock(), event={"status": "error"})
+
+    @pytest.mark.parametrize("attribute_value", ["COMPLETED", ["APPROVED", "COMPLETED"]])
+    def test_deferrable_sensor_passes_attribute_value_correctly(self, attribute_value):
+        from airflow.exceptions import TaskDeferred
+        from airflow.providers.amazon.aws.triggers.dynamodb import DynamoDBValueTrigger
+
+        sensor = DynamoDBValueSensor(
+            task_id="dynamodb_deferrable_sensor",
+            table_name=self.table_name,
+            partition_key_name=self.pk_name,
+            partition_key_value=self.pk_value,
+            attribute_name=self.attribute_name,
+            attribute_value=attribute_value,
+            deferrable=True,
+        )
+        with pytest.raises(TaskDeferred) as exc_info:
+            sensor.execute(context=mock.MagicMock())
+        trigger = exc_info.value.trigger
+        assert isinstance(trigger, DynamoDBValueTrigger)
+        expected = attribute_value if isinstance(attribute_value, str) else list(attribute_value)
+        assert trigger.attribute_value == expected
